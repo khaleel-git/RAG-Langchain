@@ -122,6 +122,42 @@ def load_job_description(job_description_path: Optional[str]) -> Optional[List[D
     if not job_description_path:
         return None
 
+    if job_description_path == "__PROMPT__":
+        if not sys.stdin.isatty():
+            raise ValueError(
+                "--job-description was used without a value in non-interactive mode. "
+                "Provide a file path, e.g. --job-description job_description.txt"
+            )
+
+        user_path = input(
+            "Enter job description file path (.txt/.pdf), or press Enter to paste text: "
+        ).strip()
+
+        if user_path:
+            job_description_path = user_path
+        else:
+            print("Paste job description text. Type END on a new line when finished:")
+            lines: List[str] = []
+            while True:
+                try:
+                    line = input()
+                except EOFError:
+                    break
+                if line.strip() == "END":
+                    break
+                lines.append(line)
+
+            text = "\n".join(lines).strip()
+            if not text:
+                raise ValueError("No job description text was provided.")
+
+            return [
+                Document(
+                    page_content=text,
+                    metadata={"source": "inline_job_description", "type": "job_description"},
+                )
+            ]
+
     path = Path(job_description_path)
     if not path.is_absolute():
         path = Path.cwd() / path
@@ -173,13 +209,48 @@ def load_or_build_vectorstore(
     docs: List[Document],
     persist_directory: str,
     force_reindex: bool,
+    chunk_size: int,
+    chunk_overlap: int,
 ) -> Chroma:
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
     if not force_reindex and Path(persist_directory).exists():
         return Chroma(embedding_function=embeddings, persist_directory=persist_directory)
 
-    return build_vectorstore(docs=docs, persist_directory=persist_directory)
+    return build_vectorstore_with_chunking(
+        docs=docs,
+        persist_directory=persist_directory,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+
+def build_vectorstore_with_chunking(
+    docs: List[Document],
+    persist_directory: Optional[str],
+    chunk_size: int,
+    chunk_overlap: int,
+) -> Chroma:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be >= 0")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    splits = text_splitter.split_documents(docs)
+
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vectorstore = Chroma.from_documents(
+        documents=splits,
+        embedding=embeddings,
+        persist_directory=persist_directory,
+    )
+    return vectorstore
 
 
 def build_rag_components(model: Optional[str]):
@@ -293,6 +364,8 @@ def start_chat_session(args: Optional[argparse.Namespace] = None) -> None:
             text_only=False,
             job_description=None,
             k=3,
+            chunk_size=150,
+            chunk_overlap=30,
             env_file=".env",
             model=None,
             interactive=True,
@@ -309,6 +382,8 @@ def start_chat_session(args: Optional[argparse.Namespace] = None) -> None:
         docs=docs,
         persist_directory=persist_dir,
         force_reindex=args.reindex,
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": args.k})
     rag_components, fallback_reason = build_rag_components(args.model)
@@ -356,13 +431,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--job-description",
         dest="job_description",
-        help="Path to a job description file (.txt or .pdf) to use as the active context.",
+        nargs="?",
+        const="__PROMPT__",
+        help="Path to a job description file (.txt or .pdf). If used without a value, you will be prompted.",
     )
     parser.add_argument(
         "--k",
         type=int,
         default=3,
         help="Number of chunks to retrieve for each query (default: 3).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=150,
+        help="Chunk size used during indexing (default: 150).",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=30,
+        help="Chunk overlap used during indexing (default: 30).",
     )
     parser.add_argument(
         "--env-file",
@@ -415,6 +504,8 @@ def main() -> None:
         docs=docs,
         persist_directory=persist_dir,
         force_reindex=args.reindex,
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": args.k})
     rag_components, fallback_reason = build_rag_components(args.model)
